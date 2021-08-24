@@ -1,0 +1,51 @@
+CREATE PROCEDURE stage.spExecuteSQLCmd 
+@SqlJSON NVARCHAR(max)
+AS
+    SET NOCOUNT ON;
+
+    DECLARE 
+    @SqlCmd NVARCHAR(MAX) = N'',
+    @row NVARCHAR(MAX),
+    @iRow INT = 0
+
+    DECLARE row_cursor CURSOR
+    FOR SELECT row
+    FROM OPENJSON(@SqlJSON)
+    WITH (
+        row NVARCHAR(max) '$.Prop_0'
+    );
+
+    OPEN row_cursor;
+
+    FETCH NEXT FROM row_cursor INTO 
+        @row
+
+    WHILE @@FETCH_STATUS = 0
+        BEGIN
+
+            SET @iRow = @iRow + 1;
+
+            IF @iRow = 1
+                SET @SqlCmd = @SqlCmd + @row + '; ';
+            ELSE IF @iRow = 2  
+                SET @SqlCmd = @SqlCmd + @row + ' ';
+            ELSE
+                SET @SqlCmd = @SqlCmd + @row + ', ';
+
+            FETCH NEXT FROM row_cursor INTO 
+                @row
+        END;
+
+    CLOSE row_cursor;
+
+    DEALLOCATE row_cursor;
+
+    SET @SqlCmd = SUBSTRING(@SqlCmd,0,LEN(@SqlCmd)-1)
+
+    -- INSERT INTO dbo.SqlCmd (SqlCmd)
+    -- VALUES (@SqlCmd);
+
+    EXEC sp_executesql @SQLCmd
+
+GO
+
