@@ -1,0 +1,254 @@
+CREATE procedure [stage].[spMergeData] (
+ @SrcDatabase nvarchar(100),
+ @SrcSchema nvarchar(100),
+ @SrcTable nvarchar(100),
+ @TgtDatabase nvarchar(100),
+ @TgtSchema nvarchar(100),
+ @TgtTable nvarchar(100),
+ @WhereClause nvarchar(500) = '',
+ @Debug char(1) = 'Y',
+ @DropSrcTable char(1) = 'N'
+ )
+ 
+as
+begin
+-------------------------------------------------------------------------------------------------------------------------------
+-- Procedure Name: spMergeData
+-- Author: Matthias Kramer
+-- Date Created: 24/08/2021
+-- Purpose: This stored procedure will dynamically generate the required MERGE SQL statement and execute it.
+--
+--
+-- Updates:
+--
+--------------------------------------------------------------------------------------------------------------------------------
+SET NOCOUNT ON
+DECLARE @MergeSQL varchar(8000), --Complete sql string
+ @TempSQL varchar(8000), --Temporary sql string
+ @Str varchar(500), --Temporary results string
+ @CTR int, --Temporary results counter
+ @NoPK int=0 --Indicates no primary key found
+ 
+ 
+CREATE TABLE #SrcCols (SelColumn varchar(100), SrcColumn varchar(100))
+CREATE TABLE #SrcPK (SrcColumn varchar(100))
+
+ 
+------------------------------------------------------------------------------------------------------------------------
+-- Generate MERGE statement
+------------------------------------------------------------------------------------------------------------------------
+ 
+--*********************************************************
+-- Retrieve source column and primay key definitions *
+--*********************************************************
+SELECT @TempSQL = ' select COLUMN_NAME as SelColumn, COLUMN_NAME as SrcColumn '+
+ ' from '+@SrcDatabase+'.INFORMATION_SCHEMA.COLUMNS '+
+ ' where TABLE_NAME = '''+@SrcTable+''''+
+ ' and TABLE_SCHEMA = '''+@SrcSchema+''''
+IF @Debug = 'Y' PRINT 'Retrieving column information from SQL Server...'
+
+INSERT INTO #SrcCols exec(@TempSQL)
+IF @Debug = 'Y' PRINT ''
+-- Check for columns
+IF NOT EXISTS (SELECT 1 FROM #SrcCols)
+BEGIN
+SELECT @Str = 'No column information found for table '+@SrcTable+'. Exiting...'
+IF @Debug = 'Y' PRINT @Str
+SELECT @Str = 'usp_merge: '+@Str
+RAISERROR(@Str,16,1)
+RETURN -1
+END
+IF @Debug = 'Y'
+BEGIN
+SELECT @Str = 'Source table columns: '
+SELECT @Str = @Str + SrcColumn + ',' from #SrcCols
+SELECT @Str = SUBSTRING(@Str,1,len(@Str)-1)
+PRINT @Str
+PRINT ''
+END
+ 
+-- Retrieve primary keys
+SELECT @TempSQL = ' select b.COLUMN_NAME as SrcColumn from ['+@SrcDatabase+'].information_schema.TABLE_CONSTRAINTS a '+
+ ' JOIN ['+@SrcDatabase+'].information_schema.CONSTRAINT_COLUMN_USAGE b on a.CONSTRAINT_NAME=b.CONSTRAINT_NAME '+
+ ' where a.CONSTRAINT_SCHEMA='''+@SrcSchema+''' and a.TABLE_NAME = '''+@SrcTable+''''+
+ ' and a.CONSTRAINT_TYPE = ''PRIMARY KEY'''
+IF @Debug = 'Y' PRINT 'Retrieving primary key information from SQL Server...'
+INSERT INTO #SrcPK exec(@TempSQL)
+ 
+--***************************************************************************************************************** 
+-- Primary keys could not be found on source server. First try to locate primary keys on target server. If
+-- they cannot be found on target server, resort to matching on every column.
+--*****************************************************************************************************************
+-- If we can't get the primary keys from the AS400, take them from SQL Server
+ IF NOT EXISTS(SELECT 1 from #SrcPK) 
+ BEGIN
+ SELECT @TempSQL = ' select b.COLUMN_NAME as SrcColumn from ['+@TgtDatabase+'].information_schema.TABLE_CONSTRAINTS a '+
+ ' JOIN ['+@TgtDatabase+'].information_schema.CONSTRAINT_COLUMN_USAGE b on a.CONSTRAINT_NAME=b.CONSTRAINT_NAME '+
+ ' where a.CONSTRAINT_SCHEMA='''+@TgtSchema+''' and a.TABLE_NAME = '''+@TgtTable+''''+
+ ' and a.CONSTRAINT_TYPE = ''PRIMARY KEY'''
+ IF @Debug = 'Y' PRINT 'Could not locate primary keys from the source. Trying target server...' 
+ INSERT INTO #SrcPK exec(@TempSQL)
+
+ -- Final hack - use every column
+ IF NOT EXISTS(SELECT 1 from #SrcPK) 
+ BEGIN
+ IF @Debug = 'Y' PRINT 'Could not locate primary keys from target server. Using all columns to match. This may be painful...'
+ INSERT INTO #SrcPK SELECT SrcColumn FROM #SrcCols
+ SELECT @NoPK = 1 
+ END
+END
+IF @Debug = 'Y' AND @NoPK = 0
+BEGIN
+SELECT @Str = 'Primary key(s) utilized: '
+SELECT @Str = @Str + SrcColumn + ',' from #SrcPK
+SELECT @Str = SUBSTRING(@Str,1,len(@Str)-1)
+PRINT @Str
+PRINT ''
+END
+ 
+--***************************************************************************************************************** 
+-- Step 1) Generate Merge statement beginning
+--
+-- Syntax: MERGE [Production].[TransactionHistory] T 
+--*****************************************************************************************************************
+SELECT @MergeSQL = 'MERGE ['+@TgtDatabase+'].['+@TgtSchema+'].['+@TgtTable+'] T USING ('
+ 
+--***************************************************************************************************************** 
+-- Step 2) Generate Merge statement source selection
+--
+-- Syntax: USING (select &quot;all fields&quot; 
+-- from Production.TransactionHistory 
+-- where TransactionID between 100000 and 102000 ') ) S 
+--
+--*****************************************************************************************************************
+SELECT @TempSQL =''
+SELECT @TempSQL = @TempSQL + SelColumn + ',' from #SrcCols
+select @TempSQL = substring(@TempSQL,1,len(@TempSQL)-1)
+select @TempSQL = replace(@TempSQL,'&quot;','''''')
+select @TempSQL = ' select '+@TempSQL+' from ['+@SrcDatabase+'].['+@SrcSchema+'].['+@SrcTable+'] '+
+ (case when @WhereClause > '' THEN ' where '+@WhereClause else '' end)+') S ' 
+SELECT @MergeSQL=@MergeSQL+@TempSQL
+ 
+--***************************************************************************************************************** 
+-- Step 3) Join syntax between source and target using primary keys
+--
+-- Syntax: ON S.TransactionID = T.TransactionID
+--
+--*****************************************************************************************************************
+IF EXISTS(Select 1 from #SrcPK)
+BEGIN
+SELECT @TempSQL = ' on '
+SELECT @TempSQL = @TempSQL + 'S.'+SrcColumn+' = T.'+SrcColumn+' and ' from #SrcPK
+SELECT @TempSQL = SUBSTRING(@TempSQL,1,len(@TempSQL)-4)
+SELECT @MergeSQL = @MergeSQL+@TempSQL
+END
+ 
+--***************************************************************************************************************** 
+-- Step 4) Update matching rows. If there is no PK, this statement is bypassed
+--
+-- Syntax: WHEN MATCHED AND 
+-- &quot;target field values&quot; &lt;&gt; &quot;source field values&quot; THEN
+-- UPDATE SET &quot;non-key target field values&quot; = &quot;non-key source field values&quot;
+--
+--*****************************************************************************************************************
+IF @NoPK = 0
+BEGIN
+SELECT @TempSQL = ' WHEN MATCHED AND '
+SELECT @TempSQL = @TempSQL + 'S.'+cols.SrcColumn+' &lt;&gt; T.'+cols.SrcColumn+' or ' 
+ from #SrcCols cols
+ left outer join #SrcPK PK on cols.SrcColumn=PK.SrcColumn
+ where PK.SrcColumn IS NULL
+SELECT @TempSQL = SUBSTRING(@TempSQL,1,len(@TempSQL)-3)
+SELECT @TempSQL = @TEMPSQL+' THEN UPDATE SET '
+SELECT @TempSQL = @TempSQL + 'T.'+cols.SrcColumn+' = S.'+cols.SrcColumn+',' 
+ from #SrcCols cols
+ left outer join #SrcPK PK on cols.SrcColumn=PK.SrcColumn
+ where PK.SrcColumn IS NULL
+SELECT @TempSQL = SUBSTRING(@TempSQL,1,len(@TempSQL)-1)
+SELECT @MergeSQL = @MergeSQL+@TempSQL
+END
+--***************************************************************************************************************** 
+-- Step 5) Inserting new rows
+--
+-- Syntax: WHEN NOT MATCHED BY TARGET THEN
+-- INSERT (&quot;target columns&quot;) 
+-- VALUES (&quot;source columns&quot;)
+--
+--*****************************************************************************************************************
+SELECT @TempSQL = ' WHEN NOT MATCHED BY TARGET THEN INSERT ('
+SELECT @TempSQL = @TempSQL+SrcColumn+',' from #SrcCols
+SELECT @TempSQL = SUBSTRING(@TempSQL,1,len(@TempSQL)-1)
+SELECT @TempSQL = @TempSQL+') VALUES ('
+SELECT @TempSQL = @TempSQL+SrcColumn+',' from #SrcCols
+SELECT @TempSQL = SUBSTRING(@TempSQL,1,len(@TempSQL)-1)
+SELECT @TempSQL = @TempSQL+') '
+SELECT @MergeSQL = @MergeSQL+@TempSQL
+ 
+--***************************************************************************************************************** 
+-- Step 6) Delete rows from target that do not exist in source. Utilize @WhereClause if it has been provided
+--
+-- Syntax: WHEN NOT MATCHED BY SOURCE AND TransactionID between 100000 and 102000 THEN DELETE
+--
+--*****************************************************************************************************************
+SELECT @MergeSQL = @MergeSQL+' WHEN NOT MATCHED BY SOURCE '+
+ (CASE WHEN @WhereClause > '' then ' AND '+@WhereClause else '' end)+' THEN DELETE '
+
+ 
+--***************************************************************************************************************** 
+-- Step 8) MERGE statement must end with a semi-colon
+--
+-- Syntax: ; 
+--
+--*****************************************************************************************************************
+SELECT @MergeSQL=@MergeSQL+';'
+ 
+--***************************************************************************************************************** 
+-- Include other debugging information
+--*****************************************************************************************************************
+IF @Debug = 'Y' 
+BEGIN
+PRINT ''
+select @STR='Length of completed merge sql statement: '+convert(varchar(10),len(@Mergesql))
+print @STR
+PRINT ''
+PRINT 'Text of completed merge sql statement'
+PRINT '-------------------------------------'
+SELECT @CTR = 1
+WHILE @CTR < len(@Mergesql)
+ BEGIN
+ SELECT @Str = substring(@MergeSQL,@CTR,200)
+ PRINT @Str
+ SELECT @CTR=@CTR+200
+ END
+PRINT ''
+-- Add a rowcount
+SELECT @MergeSQL = @MergeSQL + ' PRINT CONVERT(VARCHAR(10),@@ROWCOUNT) '
+END
+
+--***************************************************************************************************************** 
+-- Execute MERGE statement
+--***************************************************************************************************************** 
+IF @Debug = 'N' EXEC (@MergeSQL)
+IF (@@ERROR <> 0)
+ BEGIN
+ RAISERROR('usp_merge: SQL execution failed',16,1)
+ RETURN -1
+ END
+
+ 
+ 
+--***************************************************************************************************************** 
+-- Cleanup
+--***************************************************************************************************************** 
+DROP TABLE #SrcCols
+DROP TABLE #SrcPK
+
+IF @DropSrcTable = 'Y'
+    BEGIN 
+        SET @TempSQL = N''
+        SET @TempSQL = N'DROP TABLE ['+@SrcDatabase+'].['+@SrcSchema+'].['+@SrcTable+']' 
+        EXEC @TempSQL
+    END
+--RETURN 0
+ 
+END
